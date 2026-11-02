@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Callable, Literal
 from uuid import uuid4
 
+import anyio
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -351,14 +352,17 @@ def create_app(settings: RouterSettings | None = None, *, client: httpx.AsyncCli
                                 result.update(id=f"chatcmpl-{rid}", created=int(time.time()), model=model)
                                 return JSONResponse(result, headers={"x-gateway-provider": "primary" if index == 0 else "backup"})
             finally:
-                # Shield the settlement from client cancellation. The reservation itself
-                # already makes accounting safe if the process dies here.
-                settlement = asyncio.create_task(limiter.settle(reservation, charged))
-                try:
-                    await asyncio.shield(settlement)
-                except asyncio.CancelledError:
-                    await settlement
-                    raise
+                # Starlette middleware cancels through AnyIO scopes, which deliver
+                # cancellation again at each await. Shield the whole cleanup scope,
+                # including the second await after a direct asyncio cancellation.
+                # Keep the task shield too: Task.cancel() bypasses AnyIO scopes.
+                with anyio.CancelScope(shield=True):
+                    settlement = asyncio.create_task(limiter.settle(reservation, charged))
+                    try:
+                        await asyncio.shield(settlement)
+                    except asyncio.CancelledError:
+                        await settlement
+                        raise
             if index == 0 and should_retry:
                 continue
             status_code = 504 if failure == "timeout" else 503 if failure in ("rate_limited", "unavailable") else 502

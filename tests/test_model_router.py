@@ -273,3 +273,77 @@ async def test_client_cancellation_finalizes_reservation_and_stops_provider(tmp_
     assert await app.state.limiter.used(TENANT) == reservation_tokens(CompletionInput.model_validate(PAYLOAD))
     with sqlite3.connect(config.db_path) as db:
         assert db.execute("SELECT pending FROM token_charges").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_scope_waits_for_delayed_sqlite_settlement(tmp_path):
+    """ASGI middleware must not finish cancellation while SQLite is still pending.
+
+    The event gate delays the actual on-disk settlement until the test releases
+    it. AnyIO's task-state barrier lets the cancelled request run all its cleanup
+    without depending on scheduler speed or a fixed sleep.
+    """
+    import anyio
+
+    provider_started = anyio.Event()
+    request_finished = anyio.Event()
+    settlement_entered = anyio.Event()
+    release_settlement = anyio.Event()
+    settlement_finished = anyio.Event()
+    settlement_wait_finished = anyio.Event()
+    scopes = []
+
+    class DelayedSettlementLimiter(SQLiteTokenLimiter):
+        async def settle(self, reservation, actual_tokens=None):
+            settlement_entered.set()
+            try:
+                await release_settlement.wait()
+                await super().settle(reservation, actual_tokens)
+                settlement_finished.set()
+            finally:
+                settlement_wait_finished.set()
+
+    async def upstream(request):
+        provider_started.set()
+        return httpx.Response(200, json=completion())
+
+    config = settings(tmp_path)
+    limiter = DelayedSettlementLimiter(config.db_path)
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as provider:
+            app = create_app(config, client=provider, limiter=limiter)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://gateway") as client:
+                async def run_request():
+                    try:
+                        with anyio.CancelScope() as scope:
+                            scopes.append(scope)
+                            await client.post("/v1/chat/completions", headers=HEADERS, json=PAYLOAD)
+                    finally:
+                        request_finished.set()
+
+                async with anyio.create_task_group() as tasks:
+                    tasks.start_soon(run_request)
+                    try:
+                        with anyio.fail_after(5):
+                            await provider_started.wait()
+                            await settlement_entered.wait()
+                            # Cancel while cleanup is actually awaiting settlement.
+                            scopes[0].cancel()
+                            await anyio.wait_all_tasks_blocked()
+                            assert not settlement_wait_finished.is_set()
+                            assert not request_finished.is_set()
+                            assert not settlement_finished.is_set()
+                            with sqlite3.connect(config.db_path) as db:
+                                assert db.execute("SELECT pending FROM token_charges").fetchone()[0] == 1
+                            release_settlement.set()
+                            await request_finished.wait()
+                    finally:
+                        # Unblock shielded cleanup before the task group joins it,
+                        # even if an assertion or the deadlock guard above fails.
+                        release_settlement.set()
+                assert settlement_finished.is_set()
+    finally:
+        release_settlement.set()
+    assert await limiter.used(TENANT) == 7
+    with sqlite3.connect(config.db_path) as db:
+        assert db.execute("SELECT pending FROM token_charges").fetchone()[0] == 0

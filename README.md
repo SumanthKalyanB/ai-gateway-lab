@@ -23,7 +23,7 @@ python scripts/smoke.py
 
 The smoke check starts the services on temporary loopback ports, checks authorization and redaction over real HTTP, exercises both fallback triggers, and stops the services afterward. Its SQLite database is a real temporary file. See `VERIFICATION.md` for the recorded results.
 
-The GitHub Actions workflow in `.github/workflows/tests.yml` runs the same installation, automated suite, and HTTP integration checks on Python 3.12 for pushes and pull requests. Its hosted result will be available after the repository is published; the verification record currently reports local checks.
+The GitHub Actions workflow in `.github/workflows/tests.yml` runs the same installation, automated suite, and HTTP integration checks on Python 3.12 for pushes and pull requests. View the current [GitHub Actions results](https://github.com/SumanthKalyanB/quilrai-ai-gateway-assessment/actions); `VERIFICATION.md` records the local verification environment.
 
 ## Files
 
@@ -178,6 +178,8 @@ The prompt estimate is UTF-8 byte length plus 128 tokens of framing per message 
 
 The primary has a total 3000 ms deadline around headers and body consumption. On 429 or timeout, the router tries the backup once. Other HTTP failures do not trigger fallback. The primary operation is cancelled before backup begins. Both providers use separate configured credentials, and redirects are disabled.
 
+Client cancellation also stops the provider attempt. Database settlement is shielded during cleanup so the request cannot exit before its token charge is finalized, including under the web framework's repeated cancellation behavior.
+
 Gateway errors use one public shape and include a request ID:
 
 ```json
@@ -200,3 +202,4 @@ The implementation uses these primary references:
 - [Chat completion streaming events](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events) and [Starlette responses](https://www.starlette.dev/responses/) — SSE delta format and response lifecycle.
 - [SQLite transactions](https://www.sqlite.org/lang_transaction.html) — writer serialization and `BEGIN IMMEDIATE`.
 - [Python async timeouts](https://docs.python.org/3.11/library/asyncio-task.html#timeouts) — total deadlines and cancellation behavior.
+- [AnyIO cancellation and shielding](https://anyio.readthedocs.io/en/stable/cancellation.html) — protecting database cleanup from framework cancellation.
