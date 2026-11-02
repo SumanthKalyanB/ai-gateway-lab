@@ -9,7 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  assessment:
+  checks:
+    name: Gateway checks
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
